@@ -9,4 +9,5 @@ PyPDF2
 transformers
 torch
 python-dotenv
-langchain_community pypdf
+langchain_community 
+pypdf
