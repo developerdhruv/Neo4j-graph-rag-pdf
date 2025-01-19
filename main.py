@@ -13,85 +13,100 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+class PDFChatManager:
+    def __init__(self):
+        self.neo4j_uri = os.getenv("NEO4J_URI")
+        self.neo4j_username = os.getenv("NEO4J_USERNAME")
+        self.neo4j_password = os.getenv("NEO4J_PASSWORD")
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        
+        
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.llm = ChatGroq(
+            api_key=self.groq_api_key,
+            model_name="llama3-8b-8192",
+            temperature=0.7,
+            max_tokens=2048
+        )
+        
+    def clear_previous_data(self):
+        """Clear all previous document data from Neo4j"""
+        graph = Neo4jGraph(
+            url=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password
+        )
+        # Delete all Document nodes and their relationships
+        graph.query("MATCH (d:Document) DETACH DELETE d")
+        
+    def process_pdf(self, uploaded_file):
+        """Process a new PDF file"""
+        # Clear previous data
+        self.clear_previous_data()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
 
+        loader = PyPDFLoader(tmp_path)
+        documents = loader.load()
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        graph = Neo4jGraph(
+            url=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password
+        )
+        
+        graph.query("""
+            CREATE CONSTRAINT document_id IF NOT EXISTS
+            FOR (d:Document) REQUIRE d.id IS UNIQUE
+        """)
+        
+        vectorstore = Neo4jVector.from_documents(
+            documents=texts,
+            embedding=self.embeddings,
+            url=self.neo4j_uri,
+            username=self.neo4j_username,
+            password=self.neo4j_password,
+            index_name="pdf_index",
+            node_label="Document",
+            text_node_property="text",
+            embedding_node_property="embedding"
+        )
+        
+        os.unlink(tmp_path)
+        return vectorstore, len(texts)
+    
+    def init_conversation_chain(self, vectorstore):
+        """Initialize a new conversation chain"""
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="answer"
+        )
+        
+        conversation_chain = ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+            memory=memory,
+            verbose=True,
+            return_source_documents=True
+        )
+        
+        return conversation_chain
 
+# Initialize Streamlit app
 st.set_page_config(page_title="PDF Chat", layout="wide")
 
-# Initialize Groq
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Store in streamlit secrets
-llm = ChatGroq(
-    api_key=GROQ_API_KEY,
-    model_name="llama3-8b-8192",
-    temperature=0.7,
-    max_tokens=2048
-)
-
-
-
-# Initialize Neo4j Graph
-NEO4J_URI = os.getenv("NEO4J_URI") # Update with your Neo4j URI
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")  # Update with your username
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")  # Update with your password
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-def process_pdf(uploaded_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_path = tmp_file.name
-
-    loader = PyPDFLoader(tmp_path)
-    documents = loader.load()
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    texts = text_splitter.split_documents(documents)
-    
-    graph = Neo4jGraph(
-        url=NEO4J_URI,
-        username=NEO4J_USERNAME,
-        password=NEO4J_PASSWORD
-    )
-    
-    graph.query("""
-        CREATE CONSTRAINT document_id IF NOT EXISTS
-        FOR (d:Document) REQUIRE d.id IS UNIQUE
-    """)
-    
-    vectorstore = Neo4jVector.from_documents(
-        documents=texts,
-        embedding=embeddings,
-        url=NEO4J_URI,
-        username=NEO4J_USERNAME,
-        password=NEO4J_PASSWORD,
-        index_name="pdf_index",
-        node_label="Document",
-        text_node_property="text",
-        embedding_node_property="embedding"
-    )
-    
-    os.unlink(tmp_path)
-    return vectorstore, len(texts)
-
-def init_conversation_chain(vectorstore):
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"  # Specify the output key explicitly
-    )
-    
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-        memory=memory,
-        verbose=True,
-        return_source_documents=True
-    )
-    
-    return conversation_chain
-
-# Custom CSS
+# Custom CSS (same as before)
 st.markdown("""
     <style>
         .chat-message {
@@ -120,12 +135,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize session state
+if 'pdf_manager' not in st.session_state:
+    st.session_state.pdf_manager = PDFChatManager()
 if "conversation" not in st.session_state:
     st.session_state.conversation = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "pdf_processed" not in st.session_state:
-    st.session_state.pdf_processed = False
+if "current_pdf" not in st.session_state:
+    st.session_state.current_pdf = None
 
 # Main interface
 st.title("📚 PDF Chat with Graph RAG")
@@ -135,22 +152,25 @@ with st.sidebar:
     st.header("📁 Document Upload")
     uploaded_file = st.file_uploader("Upload your PDF", type="pdf")
     
-    if uploaded_file and not st.session_state.pdf_processed:
-        with st.spinner("Processing PDF..."):
-            vectorstore, num_chunks = process_pdf(uploaded_file)
-            st.session_state.conversation = init_conversation_chain(vectorstore)
-            st.session_state.pdf_processed = True
-            st.success(f"✅ PDF processed into {num_chunks} chunks!")
+    if uploaded_file:
+        if st.session_state.current_pdf != uploaded_file.name:
+            with st.spinner("Processing new PDF..."):
+                vectorstore, num_chunks = st.session_state.pdf_manager.process_pdf(uploaded_file)
+                st.session_state.conversation = st.session_state.pdf_manager.init_conversation_chain(vectorstore)
+                st.session_state.chat_history = []  # Clear chat history for new PDF
+                st.session_state.current_pdf = uploaded_file.name
+                st.success(f"✅ New PDF processed into {num_chunks} chunks!")
     
-    if st.session_state.pdf_processed:
+    if st.session_state.current_pdf:
         st.header("🔄 Reset Chat")
         if st.button("Clear Conversation"):
             st.session_state.chat_history = []
-            st.session_state.conversation = init_conversation_chain(vectorstore)
+            vectorstore, _ = st.session_state.pdf_manager.process_pdf(uploaded_file)
+            st.session_state.conversation = st.session_state.pdf_manager.init_conversation_chain(vectorstore)
             st.success("Conversation cleared!")
 
 # Main chat interface
-if not st.session_state.pdf_processed:
+if not st.session_state.current_pdf:
     st.info("👈 Please upload a PDF document to start chatting!")
 else:
     # Display chat messages
